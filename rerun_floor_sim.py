@@ -22,47 +22,57 @@ def fetch_mid(start, end):
     Fetch Elexon Market Index Data (MID) half-hourly prices.
     Returns DataFrame with columns: ['timestamp' (UTC), 'p_per_kwh']
     """
-    # Chunk by month to avoid huge payloads
-    def month_chunks(s, e):
-        cur = dt.datetime(s.year, s.month, 1, tzinfo=tz_utc)
-        while cur < e:
-            nxt = dt.datetime(cur.year + (1 if cur.month == 12 else 0),
-                              1 if cur.month == 12 else cur.month + 1, 1, tzinfo=tz_utc)
-            yield max(cur, s), min(nxt, e)
-            cur = nxt
+    import logging
+
+    logger = logging.getLogger(__name__)
+
+    # chunk by at most 7-day windows because Elexon MID requires From->To inclusive <= 7 days
+    def month_chunks(s, e, days=7):
+        cur_from = s
+        while cur_from < e:
+            # set cur_to to at most `days` later (API expects inclusive range <= days)
+            cur_to = min(cur_from + dt.timedelta(days=days), e)
+            yield cur_from, cur_to
+            # advance to the next instant after cur_to to avoid overlapping identical bounds
+            cur_from = cur_to + dt.timedelta(seconds=1)
+
+    primary = "https://data.elexon.co.uk/bmrs/api/v1/balancing/pricing/market-index"
+    fallback = primary  # keep fallback for future change if needed
 
     frames = []
-    primary = "https://bmrs.elexon.co.uk/api/balancing/pricing/market-index"
-    fallback = "https://data.elexon.co.uk/bmrs/api/v1/balancing/pricing/market-index"
 
     for s, e in month_chunks(start, end):
-        url = f"{primary}?from={s.isoformat().replace('+00:00','Z')}&to={e.isoformat().replace('+00:00','Z')}"
+        params = {"from": s.isoformat().replace("+00:00", "Z"), "to": e.isoformat().replace("+00:00", "Z")}
         try:
-            r = requests.get(url, timeout=60)
+            r = requests.get(primary, params=params, timeout=60)
             if r.status_code >= 400:
-                raise RuntimeError("Primary MID endpoint error")
+                logger.warning("Primary MID endpoint returned %s: %s", r.status_code, r.text)
+                r.raise_for_status()
             js = r.json()
-        except Exception:
-            # fallback
-            url_fb = f"{fallback}?from={s.isoformat().replace('+00:00','Z')}&to={e.isoformat().replace('+00:00','Z')}"
-            r = requests.get(url_fb, timeout=60)
+        except Exception as exc:
+            # attempt fallback (currently same as primary)
+            logger.warning("Primary MID request failed (%s). Trying fallback.", exc)
+            r = requests.get(fallback, params=params, timeout=60)
             r.raise_for_status()
             js = r.json()
 
         rows = js.get("data") if isinstance(js, dict) else js
         df = pd.DataFrame(rows)
         if df.empty:
+            # no rows for this chunk, continue to next
             continue
 
-        # Normalise schema: expect settlementDate, settlementPeriod, marketIndexPrice
+        # Normalise schema: prefer settlementDate + settlementPeriod, or timestamp
         if "settlementDate" in df.columns and "settlementPeriod" in df.columns:
             ts = pd.to_datetime(df["settlementDate"], utc=True) + pd.to_timedelta((df["settlementPeriod"] - 1) * 30, unit="m")
             df["timestamp"] = ts
         elif "timestamp" not in df.columns:
+            logger.error("Unexpected MID schema for params=%s: columns=%s", params, list(df.columns))
             raise RuntimeError("Unexpected MID schema; please inspect JSON.")
 
         price_col = "marketIndexPrice" if "marketIndexPrice" in df.columns else ("price" if "price" in df.columns else None)
         if price_col is None:
+            logger.error("MID response missing price column for params=%s; columns=%s", params, list(df.columns))
             raise RuntimeError("MID response missing price column.")
 
         # £/MWh → p/kWh (1 £/MWh = 0.1 p/kWh)
